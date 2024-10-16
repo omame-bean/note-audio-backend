@@ -63,11 +63,17 @@ class VideoResponse(BaseModel):
 
 @app.get("/download-video/{video_filename}")
 async def download_video(video_filename: str):
-    video_path = os.path.abspath(video_filename)
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    video_path = os.path.join(current_dir, video_filename)
     logger.debug(f"Requested video path: {video_path}")
     logger.debug(f"File exists: {os.path.exists(video_path)}")
     if os.path.exists(video_path):
-        return FileResponse(video_path, media_type="video/mp4", filename=os.path.basename(video_filename))
+        return FileResponse(
+            video_path,
+            media_type="video/mp4",
+            filename=video_filename,
+            headers={"Content-Disposition": f'attachment; filename="{video_filename}"'}
+        )
     else:
         raise HTTPException(status_code=404, detail=f"動画が見つかりません: {video_path}")
 
@@ -98,7 +104,7 @@ def generate_script(note_content: str) -> list:
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": "ノート内容から1〜3分の動画用の台詞を生成してください。各シーンを辞書形式で返してください。各シーンは'scene_number'、'description'、'script'のキーを持つ必要があります。返答は必ず有効なJSONフォーマットにしてください。全て日本語で書いてください。"},
+            {"role": "system", "content": "ノート内容から30秒前後の動画用の台詞を生成してください。各シーンを辞書形式で返してください。各シーンは'scene_number'、'description'、'script'のキーを持つ必要があります。返答は必ず有効なJSONフォーマットにしてください。全て日本語で書いてください。"},
             {"role": "user", "content": note_content}
         ]
     )
@@ -307,9 +313,9 @@ def create_video(script: list, images: list, audio_clips: list, background_image
                 frame_image.alpha_composite(zoomed_image, (offset_x, offset_y))
             else:  # zoom_in_out
                 if progress < 0.5:
-                    zoom_factor = 1 + (0.3 * (progress * 2))  # ここを調整
+                    zoom_factor = 1 + (0.5 * (progress * 2))  # ここを調整
                 else:
-                    zoom_factor = 1.25 - (0.5 * ((progress - 0.5) * 2))  # ここを調整
+                    zoom_factor = 1.5 - (0.5 * ((progress - 0.5) * 2))  # ここを調整
                 zoomed_size = (int(img_width * zoom_factor), int(img_height * zoom_factor))
                 zoomed_image = image.resize(zoomed_size, Image.Resampling.LANCZOS)
                 offset_x = (frame_size[0] - zoomed_size[0]) // 2
