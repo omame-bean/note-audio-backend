@@ -571,6 +571,25 @@ def create_video(script: list, images: list, audio_clips: list, background_video
         logger.debug(f"Using font file: {font_path}")
         logger.debug(f"フォントパス: {font_path} (存在: {os.path.exists(font_path)})")
 
+        # 一時ディレクトリの作成と権限の確認
+        os.makedirs(temp_dir, exist_ok=True)
+        os.chmod(temp_dir, 0o755)  # 読み取り、書き込み、実行権限を付与
+
+        # 画像の保存時にログを追加
+        for idx, image in enumerate(images):
+            img_path = os.path.join(temp_dir, f"temp_image_{idx}.png")
+            image.save(img_path)
+            logger.info(f"画像を保存しました: {img_path}")
+
+        # 画像ファイルの存在確認を早めに行う
+        for idx in range(len(image_display_times)):
+            img_path = os.path.join(temp_dir, f"temp_image_{idx}.png")
+            if not os.path.exists(img_path):
+                logger.error(f"一時画像ファイルが存在しません: {img_path}")
+                raise FileNotFoundError(f"一時画像ファイルが存在しません: {img_path}")
+            else:
+                logger.info(f"一時画像ファイルが存在します: {img_path}")
+
         # 1. 背景動画のスケーリングのみを行う
         scaled_bg = ffmpeg.input(background_video, stream_loop=-1, t=total_duration)
         scaled_output = scaled_bg.filter('scale', 'min(1280, iw)', 'min(720, ih)', force_original_aspect_ratio='decrease')\
@@ -578,17 +597,25 @@ def create_video(script: list, images: list, audio_clips: list, background_video
         scaled_output_path = os.path.join(temp_dir, "scaled_bg.mp4")
         
         try:
-            ffmpeg.output(scaled_output, scaled_output_path).overwrite_output().run(capture_stdout=True, capture_stderr=True)
+            process = (
+                ffmpeg
+                .output(scaled_output, scaled_output_path)
+                .overwrite_output()
+                .run_async(pipe_stdout=True, pipe_stderr=True)
+            )
+            stdout, stderr = process.communicate()
+            if process.returncode != 0:
+                logger.error(f"FFmpeg error: {stderr.decode()}")
+                raise ffmpeg.Error(stderr.decode())
             logger.info("背景動画のスケーリングが成功しました。")
         except ffmpeg.Error as e:
-            logger.error(f"背景動画のスケーリングに失敗しました: {e.stderr.decode()}")
+            logger.error(f"背景動画のスケーリングに失敗しました: {str(e)}")
             raise
 
         # 2. 画像のオーバーレイを追加
         video_with_images = ffmpeg.input(scaled_output_path)
         for idx, (start, end) in enumerate(image_display_times):
             img_path = os.path.join(temp_dir, f"temp_image_{idx}.png")
-            images[idx].save(img_path)
             img_input = ffmpeg.input(img_path)
             video_with_images = video_with_images.overlay(
                 img_input,
