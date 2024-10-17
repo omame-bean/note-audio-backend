@@ -19,6 +19,7 @@ import traceback
 from fastapi.responses import FileResponse
 from pydub import AudioSegment
 import random
+import textwrap  # 追加
 
 # ロギングの基本設定
 logging.basicConfig(level=logging.DEBUG)
@@ -171,8 +172,7 @@ def generate_images(script: list) -> list:
         - スクリプトの内容に直接関連する要素を含めてください。
         - シンプルで明確な線画で、カラフルに彩色してください。
         - 背景も含め、シーンの雰囲気を表現してください。
-        - 人物、物体、環境などスクリプトに出てくる要素を必ず含ください。
-        - 画像の中にテキストは入れないでください。
+        - 画像の中に文字は絶対に入れないでください。
         
         このイラストは動画のシーンとして使用されます。適切な構図と内容を心がけてください。
         """
@@ -225,7 +225,7 @@ def select_background(note_content: str) -> str:
     backgrounds = [f for f in os.listdir(movie_dir) if f.endswith('.mp4')]
     
     if not backgrounds:
-        logger.error("背景動画が見つかりません。'movie'ディレクトリにmp4ファイルを追加してください。")
+        logger.error("背景動画が見つかりません。'movie'ィレクトリにmp4ファイルを追加してください。")
         raise FileNotFoundError("背景動画が見つかりません。")
     
     prompt = f"""
@@ -276,20 +276,12 @@ def get_audio_duration(audio_path: str) -> float:
     audio = AudioSegment.from_file(audio_path)
     return len(audio) / 1000.0
 
-def wrap_text(text, font, max_width):
-    lines = []
-    words = text.split()
-    current_line = words[0]
-    for word in words[1:]:
-        test_line = current_line + " " + word
-        bbox = font.getbbox(test_line)
-        if bbox[2] - bbox[0] <= max_width:
-            current_line = test_line
-        else:
-            lines.append(current_line)
-            current_line = word
-    lines.append(current_line)
-    return lines
+def wrap_text(text, max_width=40):
+    """
+    テキストを指定した最大文字数で折り返します。
+    max_widthは仮の値で、フォントサイズや解像度に応じて調整が必要です。
+    """
+    return '\n'.join(textwrap.wrap(text, width=max_width))
 
 def create_video(script: list, images: list, audio_clips: list, background_video: str, image_display_times: list, orientation='landscape') -> str:
     # 背景動画の情報を取得
@@ -317,16 +309,32 @@ def create_video(script: list, images: list, audio_clips: list, background_video
         logger.error("オーディオの長さが0秒以下です。")
         raise ValueError("オーディオの長さが0秒以下です。")
 
+    # 各シーンごとのテロップ用タイムスタンプを作成
+    scene_timestamps = []
+    cumulative_time = 0.0
+    durations = []
+    for audio_path in audio_clips:
+        duration = get_audio_duration(audio_path)
+        durations.append(duration)
+    
+    for idx, scene in enumerate(script):
+        scene_duration = durations[idx] if idx < len(durations) else 5.0  # デフォルトを5秒とする
+        scene_start = cumulative_time
+        scene_end = cumulative_time + scene_duration
+        wrapped_text = wrap_text(scene['script'], max_width=40)  # テキストを折り返す
+        scene_timestamps.append((wrapped_text, scene_start, scene_end))
+        cumulative_time = scene_end
+
     try:
         # 背景動画を無限ループさせて、音声の長さに合わせる
         bg_input = ffmpeg.input(background_video, stream_loop=-1, t=total_duration)
         video = bg_input.video
 
-        # 背景動画を一度スケールとパッドを適用
+        # 背景動画をスケールとパッドを適用
         video = video.filter('scale', 'min(1280, iw)', 'min(720, ih)', force_original_aspect_ratio='decrease')\
                      .filter('pad', 1280, 720, '(ow-iw)/2', '(oh-ih)/2')
 
-        # 各画像をオーバーレイする
+        # 画像をオーバーレイ
         for idx, (img, start, end) in enumerate(image_display_times):
             img_path = f"temp_image_{idx}.png"
             img.save(img_path)
@@ -338,6 +346,35 @@ def create_video(script: list, images: list, audio_clips: list, background_video
                 x='(main_w-overlay_w)/2',
                 y='(main_h-overlay_h)/2',
                 enable=f'between(t,{start},{end})'
+            )
+
+        # フォントファイルの絶対パスを取得
+        font_path = os.path.join(current_dir, 'font.ttf')
+        font_path = os.path.abspath(font_path)  # 絶対パスに変換
+
+        # フォントファイルの存在確認
+        if not os.path.exists(font_path):
+            logger.error(f"フォントファイルが見つかりません: {font_path}")
+            raise FileNotFoundError(f"フォントファイルが見つかりません: {font_path}")
+        
+        logger.debug(f"Using font file: {font_path}")
+
+        # テロップを各シーンごとに追加
+        for idx, (text, start, end) in enumerate(scene_timestamps):
+            logger.debug(f"Adding text: '{text}' from {start} to {end}")
+            video = video.drawtext(
+                text=text,
+                fontfile=font_path,
+                fontsize=24,
+                fontcolor='white',
+                box=1,
+                boxcolor='black@0.8',
+                boxborderw=10,
+                x='(w-text_w)/2',  # テキストを中央配置
+                y='h-text_h-60',    # 下から60pxの位置に配置
+                enable=f'between(t,{start},{end})',
+                line_spacing=5
+                # reload=1  # 削除しました
             )
 
         audio_input = ffmpeg.input(combined_audio_path)
@@ -361,7 +398,8 @@ def create_video(script: list, images: list, audio_clips: list, background_video
         os.remove(combined_audio_path)
 
     except ffmpeg.Error as e:
-        logger.error(f"FFmpeg error: {e.stderr.decode() if e.stderr else 'No stderr'}")
+        stderr_output = e.stderr.decode() if e.stderr else 'No stderr'
+        logger.error(f"FFmpeg error: {stderr_output}")
         logger.error(f"FFmpeg error details: {str(e)}")
         raise
     except Exception as e:
