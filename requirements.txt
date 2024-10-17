@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+pydantic
+python-dotenv
+openai
+requests
+Pillow
+moviepy
+pydub
+numpy
+opencv-python-headless
+ffmpeg-python
+python-multipart
