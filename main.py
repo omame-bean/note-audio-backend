@@ -23,6 +23,7 @@ import random
 import textwrap
 from os import getenv
 import asyncio
+import aiohttp
 
 # ロギングの基本設定
 logging.basicConfig(level=logging.DEBUG)
@@ -160,15 +161,15 @@ async def run_video_generation(client_id: str, note_content: str):
         background_video = await asyncio.to_thread(select_background, note_content)
         await update_progress("背景選択", "completed", f"選択された背景動画: {background_video}")
 
-        # 画像生成
-        await update_progress("画像生成", "in-progress", "画像生成中...")
-        images = await asyncio.to_thread(generate_images, script)
-        await update_progress("画像生成", "completed", "画像が正常に生成されました")
+        # 画像生成と音声合成を並列で実行
+        await update_progress("画像生成と音声合成", "in-progress", "画像生成と音声合成を開始...")
+        images_task = asyncio.create_task(generate_images(script))
+        audio_task = asyncio.create_task(generate_audio(script))
 
-        # 音声合成
-        await update_progress("音声合成", "in-progress", "音声合成中...")
-        audio_clips, durations = await asyncio.to_thread(generate_audio, script)
-        await update_progress("音声合成", "completed", "音声が正常に合成されました")
+        # 両方のタスクが完了するまで待機
+        images, (audio_clips, durations) = await asyncio.gather(images_task, audio_task)
+
+        await update_progress("画像生成と音声合成", "completed", "画像生成と音声合成が完了しました")
 
         # 動画編集
         await update_progress("動画編集", "in-progress", "動画編集中...")
@@ -231,7 +232,7 @@ def generate_script(note_content: str) -> list:
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": "ノート内容から30秒前後の動画用の台詞を成してください。各シーンを辞書形式で返してください。各シーンは'scene_number'、'description'、'script'のキーを持つ必要があります。返答は必ず有効なJSONフォーマットにしてください。全て日本語で書いてください。"},
+            {"role": "system", "content": "ノート内容から30秒前後の動画用の台詞を成してください。各シーンを辞書形式で返してください。各シーンは'scene_number'、'description'、'script'のキーを持つ必要があります。返答は必ず有効なJSONフォーマットにしてください。全て日本語でいてください。"},
             {"role": "user", "content": note_content}
         ]
     )
@@ -268,7 +269,7 @@ def generate_script(note_content: str) -> list:
         print(f"APIレスポンス: {content}")
         raise ValueError(f"APIからの応答の処理中にエラーが発生しました: {str(e)}")
 
-def generate_images(script: list) -> list:
+async def generate_images(script: list) -> list:
     images = []
     for i in range(0, len(script), 3):
         group_scenes = script[i:i+3]
@@ -291,36 +292,40 @@ def generate_images(script: list) -> list:
         
         logger.debug(f"画像生成プロンプト（グループ {i//3 + 1}）:\n{prompt}")
         
-        response = client.images.generate(
+        response = client.images.generate(  # awaitを削除
             model="dall-e-3",
             prompt=prompt,
             n=1,
             size="1024x1024"
         )
         image_url = response.data[0].url
-        image_response = requests.get(image_url)
-        img = Image.open(BytesIO(image_response.content))
-        images.append(img)  # インデックスを含めずに画像オブジェクトのみを追加
+        async with aiohttp.ClientSession() as session:
+            async with session.get(image_url) as image_response:
+                image_data = await image_response.read()
+                img = Image.open(BytesIO(image_data))
+                images.append(img)
         
         logger.debug(f"生成された画像のURL（グループ {i//3 + 1}）: {image_url}")
-    
+
     return images
 
-def generate_audio(script: list) -> tuple:
+async def generate_audio(script: list) -> tuple:
     audio_clips = []
     durations = []
     for scene in script:
-        response = client.audio.speech.create(
+        response = client.audio.speech.create(  # awaitを削除
             model="tts-1",
             voice="shimmer",
             input=scene['script']
         )
         
+        audio_content = response.content
+
         with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as temp_audio_file:
-            temp_audio_file.write(response.content)
+            temp_audio_file.write(audio_content)
             audio_clips.append(temp_audio_file.name)
         
-        duration = get_audio_duration(temp_audio_file.name)
+        duration = await asyncio.to_thread(get_audio_duration, temp_audio_file.name)
         durations.append(duration)
     
     return audio_clips, durations
