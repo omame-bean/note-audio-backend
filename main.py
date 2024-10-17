@@ -142,6 +142,7 @@ async def events(client_id: str):
     return EventSourceResponse(event_generator())
 
 async def run_video_generation(client_id: str, note_content: str):
+    temp_dir = tempfile.mkdtemp(prefix="video_gen_")
     try:
         async def update_progress(step, status, message=None, video_url=None):
             progress = {
@@ -182,7 +183,7 @@ async def run_video_generation(client_id: str, note_content: str):
         # 動画編集
         await update_progress("動画編集", "in-progress", "動画編集中...")
         image_display_times = calculate_image_display_times(durations)
-        video_filename = await asyncio.to_thread(create_video, script, images, audio_clips, background_video, background_music, image_display_times)
+        video_filename = await asyncio.to_thread(create_video, script, images, audio_clips, background_video, background_music, image_display_times, temp_dir)
         await update_progress("動画編集", "completed", f"動画が正確に作成されました: {video_filename}")
 
         # 最終出力
@@ -196,11 +197,21 @@ async def run_video_generation(client_id: str, note_content: str):
                 break
 
     except Exception as e:
-        error_message = json.dumps({"error": f"内部サーバーエラが発生しました: {str(e)}"})
-        client_progress[client_id].append(error_message)
-        logger.error(f"クライアント {client_id} においてエラーが発生しました: {str(e)}")
-        logger.error(traceback.format_exc())
+        error_message = str(e)
+        if isinstance(e, ffmpeg._run.Error):
+            error_log_path = os.path.join(temp_dir, 'ffmpeg_error.log')
+            if os.path.exists(error_log_path):
+                with open(error_log_path, 'r') as f:
+                    error_content = f.read()
+                error_message += f"\nFFmpeg detailed error log:\n{error_content}"
+        logger.error(f"Error occurred for client {client_id}: {error_message}")
+        await send_error_to_client(client_id, error_message)
+        raise
     finally:
+        # 一時ディレクトリの削除
+        if os.path.exists(temp_dir):
+            import shutil
+            shutil.rmtree(temp_dir)
         # client_progress からの削除はクライアント側で行うため、ここでは削除しない
         pass
 
@@ -463,7 +474,7 @@ def escape_ffmpeg_text(text: str) -> str:
     text = text.replace(',', '\\,').replace(':', '\\:')
     return text
 
-def create_video(script: list, images: list, audio_clips: list, background_video: str, background_music: str, image_display_times: list, orientation='landscape') -> str:
+def create_video(script: list, images: list, audio_clips: list, background_video: str, background_music: str, image_display_times: list, temp_dir: str, orientation='landscape') -> str:
     # 背景動画の情報を取得
     probe = ffmpeg.probe(background_video)
     video_stream = next((stream for stream in probe['streams'] if stream['codec_type'] == 'video'), None)
@@ -483,11 +494,6 @@ def create_video(script: list, images: list, audio_clips: list, background_video
     logger.debug(f"背景動画パス: {background_video} (存在: {os.path.exists(background_video)})")
     logger.debug(f"背景音楽パス: {background_music} (存在: {os.path.exists(background_music)})")
 
-    # 一意な一時ディレクトリの作成
-    unique_id = uuid.uuid4().hex
-    temp_dir = tempfile.mkdtemp(prefix=f"video_gen_{unique_id}_")
-    logger.debug(f"Created temporary directory: {temp_dir}")
-    
     try:
         combined_audio_path = combine_audio(audio_clips, combined_audio_path)
         total_duration = get_audio_duration(combined_audio_path)
@@ -608,14 +614,14 @@ def create_video(script: list, images: list, audio_clips: list, background_video
             # FFmpegコマンドの実行（スレッド数制限と詳細ログ取得）
             output = output.global_args('-threads', '2', '-v', 'debug')
             ffmpeg.run(output, capture_stdout=True, capture_stderr=True)
-        except ffmpeg.Error as e:
-            stderr_output = e.stderr.decode('utf-8') if e.stderr else 'No stderr'
-            logger.error(f"FFmpeg error: {stderr_output}")
-            # 詳細なエラーログをファイルに保存
+        except ffmpeg._run.Error as e:
             error_log_path = os.path.join(temp_dir, 'ffmpeg_error.log')
-            with open(error_log_path, 'w', encoding='utf-8') as f:
-                f.write(stderr_output)
-            logger.error(f"FFmpeg error detailed log saved to {error_log_path}")
+            if os.path.exists(error_log_path):
+                with open(error_log_path, 'r') as f:
+                    error_content = f.read()
+                logger.error(f"FFmpeg detailed error log:\n{error_content}")
+            else:
+                logger.error(f"FFmpeg error log not found at {error_log_path}")
             raise
         except Exception as e:
             logger.error(f"Unexpected error in create_video: {str(e)}")
@@ -624,17 +630,21 @@ def create_video(script: list, images: list, audio_clips: list, background_video
 
         # 一時ファイルの削除
         for idx in range(len(image_display_times)):
-            os.remove(os.path.join(temp_dir, f"temp_image_{idx}.png"))
+            img_path = os.path.join(temp_dir, f"temp_image_{idx}.png")
+            if not os.path.exists(img_path):
+                logger.error(f"一時画像ファイルが存在しません: {img_path}")
+                raise FileNotFoundError(f"一時画像ファイルが存在しません: {img_path}")
+            else:
+                logger.info(f"一時画像ファイルが存在します: {img_path}")
+            os.remove(img_path)
         os.remove(combined_audio_path)
         os.remove(mixed_audio_path)
 
     finally:
-        # 一時ディレクトリとその内容を削除
-        try:
+        # 一時ディレクトリの削除
+        if os.path.exists(temp_dir):
+            import shutil
             shutil.rmtree(temp_dir)
-            logger.debug(f"Deleted temporary directory: {temp_dir}")
-        except Exception as e:
-            logger.warning(f"Failed to delete temporary directory {temp_dir}: {str(e)}")
 
     return output_path
 
@@ -664,6 +674,11 @@ def verify_files():
     
     if not os.path.exists(music_dir) or not os.listdir(music_dir):
         logger.error("musicディレクトリに音楽ファイルが存在しないか、ディレクトリ自体が存在しません。")
+
+async def send_error_to_client(client_id: str, error_message: str):
+    # この関数を適切に実装してください。例えば：
+    logger.error(f"Error for client {client_id}: {error_message}")
+    # クライアントにエラーを送信する実際の処理をここに追加
 
 if __name__ == "__main__":
     import uvicorn
