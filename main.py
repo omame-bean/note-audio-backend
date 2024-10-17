@@ -1,5 +1,7 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, FileResponse
+from sse_starlette.sse import EventSourceResponse
 from pydantic import BaseModel
 import tempfile
 import os
@@ -16,11 +18,11 @@ import cv2
 import logging
 import ffmpeg
 import traceback
-from fastapi.responses import FileResponse
 from pydub import AudioSegment
 import random
-import textwrap  # 追加
+import textwrap
 from os import getenv
+import asyncio
 
 # ロギングの基本設定
 logging.basicConfig(level=logging.DEBUG)
@@ -56,67 +58,174 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ログ設定
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+# クライアントごとの進捗を管理する辞書
+client_progress = {}
+
+
 # OpenAIクライアントの初期化
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 class VideoRequest(BaseModel):
+    client_id: str  # クライアントを一意に識別するID
     note_content: str
 
 class VideoResponse(BaseModel):
     video_url: str
 
+async def progress_generator(request: Request):
+    progress_steps = [
+        "テキスト解析",
+        "音声合成",
+        "画像生成",
+        "動画編集",
+        "最終出力"
+    ]
+    for step in progress_steps:
+        if await request.is_disconnected():
+            break
+        yield json.dumps({"step": step, "status": "in-progress", "message": f"{step}中..."})
+        await asyncio.sleep(1)  # シミュレーションのための遅延
+        yield json.dumps({"step": step, "status": "completed", "message": f"{step}完了"})
+        await asyncio.sleep(0.5)
+
+
+@app.post("/generate-video", response_model=VideoResponse)
+async def generate_video(video_request: VideoRequest, background_tasks: BackgroundTasks):
+    client_id = video_request.client_id
+    note_content = video_request.note_content
+    client_progress[client_id] = []
+    background_tasks.add_task(run_video_generation, client_id, note_content)
+    logger.info(f"クライアント {client_id} の動画生成を開始しました。ノート内容: {note_content[:100]}...")
+    return VideoResponse(video_url="")
+
+@app.get("/events/{client_id}")
+async def events(client_id: str):
+    async def event_generator():
+        logger.info(f"クライアント {client_id} がイベントのために接続しました。")
+        last_sent_index = 0
+        retry_count = 0
+        max_retries = 5
+        while retry_count < max_retries:
+            try:
+                if client_id not in client_progress:
+                    await asyncio.sleep(1)
+                    retry_count += 1
+                    continue
+                
+                steps = client_progress[client_id]
+                new_steps = steps[last_sent_index:]
+                for step in new_steps:
+                    yield {"data": step}
+                    last_sent_index += 1
+                
+                if any(json.loads(step).get("step") == "最終出力" for step in new_steps):
+                    logger.info(f"クライアント {client_id} の処理が完了しました。")
+                    break
+                
+                await asyncio.sleep(1)
+            except Exception as e:
+                logger.error(f"イベント生成中にエラーが発生しました: {str(e)}")
+                await asyncio.sleep(1)
+                retry_count += 1
+        
+        if retry_count >= max_retries:
+            logger.error(f"クライアント {client_id} の最大再試行回数に達しました。")
+    
+    return EventSourceResponse(event_generator())
+
+async def run_video_generation(client_id: str, note_content: str):
+    try:
+        async def update_progress(step, status, message=None, video_url=None):
+            progress = {
+                "step": step,
+                "status": status,
+                "message": message,
+                "video_url": video_url
+            }
+            client_progress[client_id].append(json.dumps(progress))
+            logger.info(f"クライアント {client_id}: {progress}")
+            await asyncio.sleep(0.1)  # 短い遅延を追加
+
+        # テキスト解析
+        await update_progress("テキスト解析", "in-progress", "テキスト解析中...")
+        script = await asyncio.to_thread(generate_script, note_content)
+        await update_progress("テキスト解析", "completed", "台詞が正常に生成されました")
+
+        # 背景選択
+        await update_progress("背景選択", "in-progress", "背景動画を選択中...")
+        background_video = await asyncio.to_thread(select_background, note_content)
+        await update_progress("背景選択", "completed", f"選択された背景動画: {background_video}")
+
+        # 画像生成
+        await update_progress("画像生成", "in-progress", "画像生成中...")
+        images = await asyncio.to_thread(generate_images, script)
+        await update_progress("画像生成", "completed", "画像が正常に生成されました")
+
+        # 音声合成
+        await update_progress("音声合成", "in-progress", "音声合成中...")
+        audio_clips, durations = await asyncio.to_thread(generate_audio, script)
+        await update_progress("音声合成", "completed", "音声が正常に合成されました")
+
+        # 動画編集
+        await update_progress("動画編集", "in-progress", "動画編集中...")
+        image_display_times = calculate_image_display_times(durations)
+        video_filename = await asyncio.to_thread(create_video, script, images, audio_clips, background_video, image_display_times)
+        await update_progress("動画編集", "completed", f"動画が正確に作成されました: {video_filename}")
+
+        # 最終出力
+        video_url = f"/download-video/{os.path.basename(video_filename)}"
+        await update_progress("最終出力", "completed", "動画生成が完了しました", video_url)
+
+        # 接続終了メッセージを送信せず、クライアントからの切断を待つ
+        while True:
+            await asyncio.sleep(10)  # 10秒ごとにチェック
+            if client_id not in client_progress:
+                break
+
+    except Exception as e:
+        error_message = json.dumps({"error": f"内部サーバーエラーが発生しました: {str(e)}"})
+        client_progress[client_id].append(error_message)
+        logger.error(f"クライアント {client_id} においてエラーが発生しました: {str(e)}")
+        logger.error(traceback.format_exc())
+    finally:
+        # client_progress からの削除はクライアント側で行うため、ここでは削除しない
+        pass
+
+# 画像表示時間を計算する関数（必要に応じて調整）
+def calculate_image_display_times(durations):
+    image_display_times = []
+    cumulative_time = 0.0
+    for i in range(0, len(durations), 3):
+        group_durations = durations[i:i+3]
+        start_time = cumulative_time
+        display_duration = sum(group_durations)
+        end_time = start_time + display_duration
+        image_display_times.append((start_time, end_time))
+        cumulative_time = end_time
+    return image_display_times
+
 @app.get("/download-video/{video_filename}")
-async def download_video(video_filename: str):
+async def download_video(video_filename: str, client_id: str = Query(...)):
     current_dir = os.path.dirname(os.path.abspath(__file__))
     video_path = os.path.join(current_dir, video_filename)
     logger.debug(f"Requested video path: {video_path}")
     logger.debug(f"File exists: {os.path.exists(video_path)}")
     if os.path.exists(video_path):
+        # クライアントの進捗情報を削除
+        if client_id in client_progress:
+            del client_progress[client_id]
+        
         return FileResponse(
             video_path,
             media_type="video/mp4",
-            filename=video_filename,
-            headers={"Content-Disposition": f'attachment; filename="{video_filename}"'}
+            filename=video_filename
         )
     else:
         raise HTTPException(status_code=404, detail=f"動画が見つかりません: {video_path}")
-
-@app.post("/generate-video", response_model=VideoResponse)
-async def generate_video(request: VideoRequest):
-    try:
-        script = generate_script(request.note_content)
-        logger.info("台詞が正常に生成されました")
-
-        background_video = select_background(request.note_content)
-        logger.info(f"選択された背景動画: {background_video}")
-        
-        if not os.path.exists(background_video):
-            raise FileNotFoundError(f"選択された背景動画が見つかりません: {background_video}")
-
-        images = generate_images(script)
-        logger.info("画像が正常に生成されました")
-
-        audio_clips, durations = generate_audio(script)
-        logger.info("音声が正常に合成されました")
-
-        # 3シーンごとのグループ分けと表示時間の計算
-        image_display_times = []
-        cumulative_time = 0.0
-        for i in range(0, len(durations), 3):
-            group_durations = durations[i:i+3]
-            start_time = cumulative_time
-            display_duration = sum(group_durations)
-            end_time = start_time + display_duration
-            image_display_times.append((images[i//3][1], start_time, end_time))
-            cumulative_time = end_time
-
-        video_filename = create_video(script, images, audio_clips, background_video, image_display_times)
-        logger.info(f"動画が正確に作成されました: {video_filename}")
-        return VideoResponse(video_url=f"/download-video/{os.path.basename(video_filename)}")
-    except Exception as e:
-        logger.error(f"generate_videoで予期せぬエラーが発生しました: {str(e)}")
-        logger.error(f"スタックトレース: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"内部サーバーエラーが発生しました: {str(e)}")
 
 def generate_script(note_content: str) -> list:
     response = client.chat.completions.create(
@@ -161,8 +270,8 @@ def generate_script(note_content: str) -> list:
 
 def generate_images(script: list) -> list:
     images = []
-    for i in range(0, len(script), 3):  # 5から3に変更
-        group_scenes = script[i:i+3]  # 5から3に変更
+    for i in range(0, len(script), 3):
+        group_scenes = script[i:i+3]
         combined_script = "\n".join([f"シーン{scene['scene_number']}: {scene['script']}" for scene in group_scenes])
         
         prompt = f"""
@@ -180,7 +289,7 @@ def generate_images(script: list) -> list:
         このイラストは動画のシーンとして使用されます。適切な構図と内容を心がけてください。
         """
         
-        logger.debug(f"画像生成プロンプト（グループ {i//3 + 1}）:\n{prompt}")  # 5から3に変更
+        logger.debug(f"画像生成プロンプト（グループ {i//3 + 1}）:\n{prompt}")
         
         response = client.images.generate(
             model="dall-e-3",
@@ -191,9 +300,9 @@ def generate_images(script: list) -> list:
         image_url = response.data[0].url
         image_response = requests.get(image_url)
         img = Image.open(BytesIO(image_response.content))
-        images.append((i, img))
+        images.append(img)  # インデックスを含めずに画像オブジェクトのみを追加
         
-        logger.debug(f"生された画像のURL（グループ {i//3 + 1}）: {image_url}")  # 5から3に変更
+        logger.debug(f"生成された画像のURL（グループ {i//3 + 1}）: {image_url}")
     
     return images
 
@@ -338,9 +447,9 @@ def create_video(script: list, images: list, audio_clips: list, background_video
                      .filter('pad', 1280, 720, '(ow-iw)/2', '(oh-ih)/2')
 
         # 画像をオーバーレイ
-        for idx, (img, start, end) in enumerate(image_display_times):
+        for idx, (start, end) in enumerate(image_display_times):
             img_path = f"temp_image_{idx}.png"
-            img.save(img_path)
+            images[idx].save(img_path)  # インデックスを使用して画像にアクセス
             img_input = ffmpeg.input(img_path)
             
             # 画像を中央にオーバーレイ
@@ -377,7 +486,6 @@ def create_video(script: list, images: list, audio_clips: list, background_video
                 y='h-text_h-60',    # 下から60pxの位置に配置
                 enable=f'between(t,{start},{end})',
                 line_spacing=5
-                # reload=1  # 削除しました
             )
 
         audio_input = ffmpeg.input(combined_audio_path)
