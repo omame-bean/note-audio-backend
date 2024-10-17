@@ -161,6 +161,11 @@ async def run_video_generation(client_id: str, note_content: str):
         background_video = await asyncio.to_thread(select_background, note_content)
         await update_progress("背景選択", "completed", f"選択された背景動画: {background_video}")
 
+        # 背景音楽選択
+        await update_progress("背景音楽選択", "in-progress", "背景音楽を選択中...")
+        background_music = await asyncio.to_thread(select_background_music, note_content)
+        await update_progress("背景音楽選択", "completed", f"選択された背景音楽: {background_music}")
+
         # 画像生成と音声合成を並列で実行
         await update_progress("画像生成と音声合成", "in-progress", "画像生成と音声合成を開始...")
         images_task = asyncio.create_task(generate_images(script))
@@ -174,7 +179,7 @@ async def run_video_generation(client_id: str, note_content: str):
         # 動画編集
         await update_progress("動画編集", "in-progress", "動画編集中...")
         image_display_times = calculate_image_display_times(durations)
-        video_filename = await asyncio.to_thread(create_video, script, images, audio_clips, background_video, image_display_times)
+        video_filename = await asyncio.to_thread(create_video, script, images, audio_clips, background_video, background_music, image_display_times)
         await update_progress("動画編集", "completed", f"動画が正確に作成されました: {video_filename}")
 
         # 最終出力
@@ -276,14 +281,14 @@ async def generate_images(script: list) -> list:
         combined_script = "\n".join([f"シーン{scene['scene_number']}: {scene['script']}" for scene in group_scenes])
         
         prompt = f"""
-        以下の内容を表現する手描きのイラスト生成してください：
+        以下の内容を表現するリアルに近いイラストを生成してください。人物はいりません。：
         
         {combined_script}
         
         要件：
-        - 必ず手描きのイラストスタイルで描いてください。写真や実写は不可。
+        - 必ずリアルに近いイラストスタイルで描いてください。
+        - 人物は描かないでください。風景や景色を描いてください。
         - スクリプトの内容に直接関連する要素を含めてください。
-        - シンプルで明確な線画で、カラフルに彩色してください。
         - 背景も含め、シーンの雰囲気を表現してください。
         - 画像の中に文字は絶対に入れないでください。
         
@@ -315,7 +320,7 @@ async def generate_audio(script: list) -> tuple:
     for scene in script:
         response = client.audio.speech.create(  # awaitを削除
             model="tts-1",
-            voice="shimmer",
+            voice="nova",
             input=scene['script']
         )
         
@@ -376,6 +381,51 @@ def select_background(note_content: str) -> str:
     
     return full_path
 
+def select_background_music(note_content: str) -> str:
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    music_dir = os.path.join(current_dir, "music")
+    
+    if not os.path.exists(music_dir):
+        os.makedirs(music_dir)
+        logger.warning(f"'music'ディレクトリが存在しなかったため、作成しました: {music_dir}")
+    
+    music_files = [f for f in os.listdir(music_dir) if f.endswith(('.mp3', '.wav'))]
+    
+    if not music_files:
+        logger.error("背景音楽が見つかりません。'music'ディレクトリに音楽ファイルを追加してください。")
+        raise FileNotFoundError("背景音楽が見つかりません。")
+    
+    prompt = f"""
+    以下のノート内容に最も適した背景音楽を選んでください。
+    選択肢は次の通りです: {', '.join(music_files)}
+    
+    ノート内容:
+    {note_content}
+    
+    最も適切な背景音楽のファイル名のみを返してください。
+    """
+    
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "あなたは与えられたノート内容に基づいて最適な背景音楽を選択する専門家です。"},
+            {"role": "user", "content": prompt}
+        ]
+    )
+    
+    selected_music = response.choices[0].message.content.strip()
+    logger.info(f"選択された背景音楽: {selected_music}")
+    
+    if selected_music not in music_files:
+        logger.warning(f"選択された背景音楽 '{selected_music}' が見つかりません。最初の音楽ファイルを使用します。")
+        selected_music = music_files[0]
+    
+    full_path = os.path.join(music_dir, selected_music)
+    logger.info(f"使用する背景音楽の完全パス: {full_path}")
+    logger.info(f"背景音楽ファイルが存在するか: {os.path.exists(full_path)}")
+    
+    return full_path
+
 def combine_audio(audio_paths: list, output_path: str) -> str:
     try:
         combined = AudioSegment.empty()
@@ -400,7 +450,7 @@ def wrap_text(text, max_width=40):
     """
     return '\n'.join(textwrap.wrap(text, width=max_width))
 
-def create_video(script: list, images: list, audio_clips: list, background_video: str, image_display_times: list, orientation='landscape') -> str:
+def create_video(script: list, images: list, audio_clips: list, background_video: str, background_music: str, image_display_times: list, orientation='landscape') -> str:
     # 背景動画の情報を取得
     probe = ffmpeg.probe(background_video)
     video_stream = next((stream for stream in probe['streams'] if stream['codec_type'] == 'video'), None)
@@ -425,6 +475,22 @@ def create_video(script: list, images: list, audio_clips: list, background_video
     if total_duration <= 0:
         logger.error("オーディオの長さが0秒以下です。")
         raise ValueError("オーディオの長さが0秒以下です。")
+
+    # 背景音楽の準備
+    background_music_audio = AudioSegment.from_file(background_music)
+    background_music_audio = background_music_audio - 25  # 音量を30%下げる（-10dB）
+    if len(background_music_audio) < total_duration * 1000:
+        background_music_audio = background_music_audio * (int(total_duration * 1000 / len(background_music_audio)) + 1)
+    background_music_audio = background_music_audio[:int(total_duration * 1000)]
+    
+    # 音声の音量を90%に下げる
+    voice_audio = AudioSegment.from_file(combined_audio_path)
+    voice_audio = voice_audio + 0.11  # 音量
+
+    # 音声と背景音楽をミックス
+    mixed_audio = voice_audio.overlay(background_music_audio)
+    mixed_audio_path = os.path.join(current_dir, f"mixed_audio_{timestamp}.mp3")
+    mixed_audio.export(mixed_audio_path, format='mp3')
 
     # 各シーンごとのテロップ用タイムスタンプを作成
     scene_timestamps = []
@@ -493,7 +559,19 @@ def create_video(script: list, images: list, audio_clips: list, background_video
                 line_spacing=5
             )
 
-        audio_input = ffmpeg.input(combined_audio_path)
+        # フェードイン・フェードアウトの長さ（秒）
+        fade_duration = 1.0
+
+        # 動画にフェードイン・フェードアウトを追加
+        video = video.filter('fade', type='in', duration=fade_duration)
+        video = video.filter('fade', type='out', start_time=total_duration-fade_duration, duration=fade_duration)
+
+        # 音声入力を変更
+        audio_input = ffmpeg.input(mixed_audio_path)
+
+        # 音声にフェードイン・フェードアウトを追加
+        audio_input = audio_input.filter('afade', type='in', duration=fade_duration)
+        audio_input = audio_input.filter('afade', type='out', start_time=total_duration-fade_duration, duration=fade_duration)
 
         # 動画と音声を結合して出力
         output = (
@@ -512,6 +590,7 @@ def create_video(script: list, images: list, audio_clips: list, background_video
         for idx in range(len(image_display_times)):
             os.remove(f"temp_image_{idx}.png")
         os.remove(combined_audio_path)
+        os.remove(mixed_audio_path)
 
     except ffmpeg.Error as e:
         stderr_output = e.stderr.decode() if e.stderr else 'No stderr'
