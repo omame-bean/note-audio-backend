@@ -20,6 +20,7 @@ from fastapi.responses import FileResponse
 from pydub import AudioSegment
 import random
 import textwrap  # 追加
+from os import getenv
 
 # ロギングの基本設定
 logging.basicConfig(level=logging.DEBUG)
@@ -45,9 +46,11 @@ async def check_ffmpeg():
         return {"error": str(e)}
 
 # CORSミドルウェアを追加
+FRONTEND_URL = getenv("FRONTEND_URL", "http://localhost:3000")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "https://your-frontend-domain.com"],  # フロントエンドのURLを指定
+    allow_origins=[FRONTEND_URL],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
