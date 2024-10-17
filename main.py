@@ -24,6 +24,9 @@ import textwrap
 from os import getenv
 import asyncio
 import aiohttp
+import uuid
+import shutil
+import shlex
 
 # ロギングの基本設定
 logging.basicConfig(level=logging.DEBUG)
@@ -193,7 +196,7 @@ async def run_video_generation(client_id: str, note_content: str):
                 break
 
     except Exception as e:
-        error_message = json.dumps({"error": f"内部サーバーエラ���が発生しました: {str(e)}"})
+        error_message = json.dumps({"error": f"内部サーバーエラが発生しました: {str(e)}"})
         client_progress[client_id].append(error_message)
         logger.error(f"クライアント {client_id} においてエラーが発生しました: {str(e)}")
         logger.error(traceback.format_exc())
@@ -450,6 +453,16 @@ def wrap_text(text, max_width=40):
     """
     return '\n'.join(textwrap.wrap(text, width=max_width))
 
+def escape_ffmpeg_text(text: str) -> str:
+    """
+    FFmpegのdrawtextフィルターで使用するテキストをエスケープする関数
+    """
+    # バックスラッシュとシングルクォートをエスケープ
+    text = text.replace('\\', '\\\\').replace("'", "\\'")
+    # カンマとコロンをエスケープ
+    text = text.replace(',', '\\,').replace(':', '\\:')
+    return text
+
 def create_video(script: list, images: list, audio_clips: list, background_video: str, background_music: str, image_display_times: list, orientation='landscape') -> str:
     # 背景動画の情報を取得
     probe = ffmpeg.probe(background_video)
@@ -470,46 +483,51 @@ def create_video(script: list, images: list, audio_clips: list, background_video
     logger.debug(f"背景動画パス: {background_video} (存在: {os.path.exists(background_video)})")
     logger.debug(f"背景音楽パス: {background_music} (存在: {os.path.exists(background_music)})")
 
-    combined_audio_path = combine_audio(audio_clips, combined_audio_path)
-    total_duration = get_audio_duration(combined_audio_path)
-
-    if total_duration <= 0:
-        logger.error("オーディオの長さが0秒以下です。")
-        raise ValueError("オーディオの長さが0秒以下です。")
-
-    # 背景音楽の準備
-    background_music_audio = AudioSegment.from_file(background_music)
-    background_music_audio = background_music_audio - 25  # 音量を30%下げる（-10dB）
-    if len(background_music_audio) < total_duration * 1000:
-        background_music_audio = background_music_audio * (int(total_duration * 1000 / len(background_music_audio)) + 1)
-    background_music_audio = background_music_audio[:int(total_duration * 1000)]
+    # 一意な一時ディレクトリの作成
+    unique_id = uuid.uuid4().hex
+    temp_dir = tempfile.mkdtemp(prefix=f"video_gen_{unique_id}_")
+    logger.debug(f"Created temporary directory: {temp_dir}")
     
-    # 音声の音量を90%に下げる
-    voice_audio = AudioSegment.from_file(combined_audio_path)
-    voice_audio = voice_audio + 0.11  # 音量
-
-    # 音声と背景音楽をミックス
-    mixed_audio = voice_audio.overlay(background_music_audio)
-    mixed_audio_path = os.path.join(current_dir, f"mixed_audio_{timestamp}.mp3")
-    mixed_audio.export(mixed_audio_path, format='mp3')
-
-    # 各シーンごとのテロップ用タイムスタンプを作成
-    scene_timestamps = []
-    cumulative_time = 0.0
-    durations = []
-    for audio_path in audio_clips:
-        duration = get_audio_duration(audio_path)
-        durations.append(duration)
-    
-    for idx, scene in enumerate(script):
-        scene_duration = durations[idx] if idx < len(durations) else 5.0  # デフォルトを5秒とする
-        scene_start = cumulative_time
-        scene_end = cumulative_time + scene_duration
-        wrapped_text = wrap_text(scene['script'], max_width=40)  # テキストを折り返す
-        scene_timestamps.append((wrapped_text, scene_start, scene_end))
-        cumulative_time = scene_end
-
     try:
+        combined_audio_path = combine_audio(audio_clips, combined_audio_path)
+        total_duration = get_audio_duration(combined_audio_path)
+
+        if total_duration <= 0:
+            logger.error("オーディオの長さが0秒以下です。")
+            raise ValueError("オーディオの長さが0秒以下です。")
+
+        # 背景音楽の準備
+        background_music_audio = AudioSegment.from_file(background_music)
+        background_music_audio = background_music_audio - 25  # 音量を30%下げる（-10dB）
+        if len(background_music_audio) < total_duration * 1000:
+            background_music_audio = background_music_audio * (int(total_duration * 1000 / len(background_music_audio)) + 1)
+        background_music_audio = background_music_audio[:int(total_duration * 1000)]
+        
+        # 音声の音量を90%に下げる
+        voice_audio = AudioSegment.from_file(combined_audio_path)
+        voice_audio = voice_audio + 0.11  # 音量
+
+        # 音声と背景音楽をミックス
+        mixed_audio = voice_audio.overlay(background_music_audio)
+        mixed_audio_path = os.path.join(current_dir, f"mixed_audio_{timestamp}.mp3")
+        mixed_audio.export(mixed_audio_path, format='mp3')
+
+        # 各シーンごとのテロップ用タイムスタンプを作成
+        scene_timestamps = []
+        cumulative_time = 0.0
+        durations = []
+        for audio_path in audio_clips:
+            duration = get_audio_duration(audio_path)
+            durations.append(duration)
+        
+        for idx, scene in enumerate(script):
+            scene_duration = durations[idx] if idx < len(durations) else 5.0  # デフォルトを5秒とする
+            scene_start = cumulative_time
+            scene_end = cumulative_time + scene_duration
+            wrapped_text = wrap_text(scene['script'], max_width=40)  # テキストを折り返す
+            scene_timestamps.append((wrapped_text, scene_start, scene_end))
+            cumulative_time = scene_end
+
         # 背景動画を無限ループさせて、音声の長さに合わせる
         bg_input = ffmpeg.input(background_video, stream_loop=-1, t=total_duration)
         video = bg_input.video
@@ -520,8 +538,8 @@ def create_video(script: list, images: list, audio_clips: list, background_video
 
         # 画像をオーバーレイ
         for idx, (start, end) in enumerate(image_display_times):
-            img_path = f"temp_image_{idx}.png"
-            images[idx].save(img_path)  # インデックスを使用して画像にアクセス
+            img_path = os.path.join(temp_dir, f"temp_image_{idx}.png")
+            images[idx].save(img_path)  # 一意なパスで画像を保存
             img_input = ffmpeg.input(img_path)
             
             # 画像を中央にオーバーレイ
@@ -546,9 +564,10 @@ def create_video(script: list, images: list, audio_clips: list, background_video
 
         # テロップを各シーンごとに追加
         for idx, (text, start, end) in enumerate(scene_timestamps):
-            logger.debug(f"Adding text: '{text}' from {start} to {end}")
+            escaped_text = escape_ffmpeg_text(text)
+            logger.debug(f"Adding text: '{escaped_text}' from {start} to {end}")
             video = video.drawtext(
-                text=text,
+                text=escaped_text,
                 fontfile=font_path,
                 fontsize=24,
                 fontcolor='white',
@@ -586,11 +605,17 @@ def create_video(script: list, images: list, audio_clips: list, background_video
         logger.info(f"FFmpegコマンド: {' '.join(ffmpeg.compile(output))}")
         
         try:
-            # FFmpegコマンドの実行
+            # FFmpegコマンドの実行（スレッド数制限と詳細ログ取得）
+            output = output.global_args('-threads', '2', '-v', 'debug')
             ffmpeg.run(output, capture_stdout=True, capture_stderr=True)
         except ffmpeg.Error as e:
-            stderr_output = e.stderr.decode() if e.stderr else 'No stderr'
+            stderr_output = e.stderr.decode('utf-8') if e.stderr else 'No stderr'
             logger.error(f"FFmpeg error: {stderr_output}")
+            # 詳細なエラーログをファイルに保存
+            error_log_path = os.path.join(temp_dir, 'ffmpeg_error.log')
+            with open(error_log_path, 'w', encoding='utf-8') as f:
+                f.write(stderr_output)
+            logger.error(f"FFmpeg error detailed log saved to {error_log_path}")
             raise
         except Exception as e:
             logger.error(f"Unexpected error in create_video: {str(e)}")
@@ -599,17 +624,17 @@ def create_video(script: list, images: list, audio_clips: list, background_video
 
         # 一時ファイルの削除
         for idx in range(len(image_display_times)):
-            os.remove(f"temp_image_{idx}.png")
+            os.remove(os.path.join(temp_dir, f"temp_image_{idx}.png"))
         os.remove(combined_audio_path)
         os.remove(mixed_audio_path)
 
-    except ffmpeg.Error as e:
-        stderr_output = e.stderr.decode() if e.stderr else 'No stderr'
-        logger.error(f"FFmpeg error: {stderr_output}")
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error in create_video: {str(e)}")
-        raise
+    finally:
+        # 一時ディレクトリとその内容を削除
+        try:
+            shutil.rmtree(temp_dir)
+            logger.debug(f"Deleted temporary directory: {temp_dir}")
+        except Exception as e:
+            logger.warning(f"Failed to delete temporary directory {temp_dir}: {str(e)}")
 
     return output_path
 
