@@ -606,10 +606,10 @@ def create_video(script: list, images: list, audio_clips: list, background_video
             stdout, stderr = process.communicate()
             if process.returncode != 0:
                 logger.error(f"FFmpeg error: {stderr.decode()}")
-                raise ffmpeg.Error(stderr.decode())
+                raise ffmpeg.Error(cmd=process.args, stdout=stdout, stderr=stderr)
             logger.info("背景動画のスケーリングが成功しました。")
         except ffmpeg.Error as e:
-            logger.error(f"背景動画のスケーリングに失敗しました: {str(e)}")
+            logger.error(f"背景動画のスケーリングに失敗しました: {e.stderr.decode()}")
             raise
 
         # 2. 画像のオーバーレイを追加
@@ -626,7 +626,15 @@ def create_video(script: list, images: list, audio_clips: list, background_video
         
         video_with_images_path = os.path.join(temp_dir, "video_with_images.mp4")
         try:
-            ffmpeg.output(video_with_images, video_with_images_path).overwrite_output().run(capture_stdout=True, capture_stderr=True)
+            process = (
+                ffmpeg.output(video_with_images, video_with_images_path)
+                .overwrite_output()
+                .run_async(pipe_stdout=True, pipe_stderr=True)
+            )
+            stdout, stderr = process.communicate()
+            if process.returncode != 0:
+                logger.error(f"FFmpeg error: {stderr.decode()}")
+                raise ffmpeg.Error(cmd=process.args, stdout=stdout, stderr=stderr)
             logger.info("画像のオーバーレイが成功しました。")
         except ffmpeg.Error as e:
             logger.error(f"画像のオーバーレイに失敗しました: {e.stderr.decode()}")
