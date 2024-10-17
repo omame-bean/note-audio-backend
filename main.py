@@ -193,7 +193,7 @@ async def run_video_generation(client_id: str, note_content: str):
                 break
 
     except Exception as e:
-        error_message = json.dumps({"error": f"内部サーバーエラーが発生しました: {str(e)}"})
+        error_message = json.dumps({"error": f"内部サーバーエラ���が発生しました: {str(e)}"})
         client_progress[client_id].append(error_message)
         logger.error(f"クライアント {client_id} においてエラーが発生しました: {str(e)}")
         logger.error(traceback.format_exc())
@@ -467,7 +467,8 @@ def create_video(script: list, images: list, audio_clips: list, background_video
     logger.debug(f"Current directory: {current_dir}")
     logger.debug(f"Output path: {output_path}")
     logger.debug(f"Combined audio path: {combined_audio_path}")
-    logger.debug(f"Background video: {background_video}")
+    logger.debug(f"背景動画パス: {background_video} (存在: {os.path.exists(background_video)})")
+    logger.debug(f"背景音楽パス: {background_music} (存在: {os.path.exists(background_music)})")
 
     combined_audio_path = combine_audio(audio_clips, combined_audio_path)
     total_duration = get_audio_duration(combined_audio_path)
@@ -541,6 +542,7 @@ def create_video(script: list, images: list, audio_clips: list, background_video
             raise FileNotFoundError(f"フォントファイルが見つかりません: {font_path}")
         
         logger.debug(f"Using font file: {font_path}")
+        logger.debug(f"フォントパス: {font_path} (存在: {os.path.exists(font_path)})")
 
         # テロップを各シーンごとに追加
         for idx, (text, start, end) in enumerate(scene_timestamps):
@@ -583,7 +585,16 @@ def create_video(script: list, images: list, audio_clips: list, background_video
         logger.info("FFmpegコマンドを実行します")
         logger.info(f"FFmpegコマンド: {' '.join(ffmpeg.compile(output))}")
         
-        ffmpeg.run(output)
+        try:
+            # FFmpegコマンドの実行
+            ffmpeg.run(output, capture_stdout=True, capture_stderr=True)
+        except ffmpeg.Error as e:
+            stderr_output = e.stderr.decode() if e.stderr else 'No stderr'
+            logger.error(f"FFmpeg error: {stderr_output}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error in create_video: {str(e)}")
+            raise
         logger.info(f"動画が正常に作成されました: {output_path}")
 
         # 一時ファイルの削除
@@ -595,7 +606,6 @@ def create_video(script: list, images: list, audio_clips: list, background_video
     except ffmpeg.Error as e:
         stderr_output = e.stderr.decode() if e.stderr else 'No stderr'
         logger.error(f"FFmpeg error: {stderr_output}")
-        logger.error(f"FFmpeg error details: {str(e)}")
         raise
     except Exception as e:
         logger.error(f"Unexpected error in create_video: {str(e)}")
@@ -610,6 +620,25 @@ async def test_script():
         return {"script": script}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+def verify_files():
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    font_path = os.path.join(current_dir, 'font.ttf')
+    movie_dir = os.path.join(current_dir, "movie")
+    music_dir = os.path.join(current_dir, "music")
+    
+    logger.info(f"フォントファイルの存在: {os.path.exists(font_path)} ({font_path})")
+    logger.info(f"movieディレクトリの存在: {os.path.exists(movie_dir)} ({movie_dir})")
+    logger.info(f"musicディレクトリの存在: {os.path.exists(music_dir)} ({music_dir})")
+    
+    if not os.path.exists(font_path):
+        logger.error("font.ttfが存在しません。")
+    
+    if not os.path.exists(movie_dir) or not os.listdir(movie_dir):
+        logger.error("movieディレクトリにmp4ファイルが存在しないか、ディレクトリ自体が存在しません。")
+    
+    if not os.path.exists(music_dir) or not os.listdir(music_dir):
+        logger.error("musicディレクトリに音楽ファイルが存在しないか、ディレクトリ自体が存在しません。")
 
 if __name__ == "__main__":
     import uvicorn
