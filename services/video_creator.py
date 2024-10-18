@@ -22,14 +22,18 @@ async def create_video(script: list, images: list, audio_clips: list, background
         output_path = os.path.join(current_dir, "..", f"generated_video_{timestamp}.mp4")
         combined_audio_path = os.path.join(current_dir, "..", f"combined_audio_{timestamp}.mp3")
 
+        # フェード処理の時間を定義
+        video_fade_duration = 2.0  # ビデオのフェード時間
+        audio_fade_duration = 0.5  # 音声のフェード時間
+
         logger.info("音声ファイルの結合開始")
         combined_audio_path = await asyncio.to_thread(combine_audio, audio_clips, combined_audio_path)
         total_duration = sum(durations)
         logger.info(f"音声ファイルの結合完了。総再生時間: {total_duration}秒")
 
-        logger.info("背景音楽の準備開")
+        logger.info("背景音楽の準備開始")
         background_music_audio = await asyncio.to_thread(AudioSegment.from_file, background_music)
-        background_music_audio = background_music_audio - 20  # 音量を30%下げる（-10dB）
+        background_music_audio = background_music_audio - 20  # 音量を20%下げる（-10dB）
         if len(background_music_audio) < total_duration * 1000:
             background_music_audio = background_music_audio * (int(total_duration * 1000 / len(background_music_audio)) + 1)
         background_music_audio = background_music_audio[:int(total_duration * 1000)]
@@ -37,20 +41,33 @@ async def create_video(script: list, images: list, audio_clips: list, background
         
         logger.info("音声ミキシング開始")
         voice_audio = await asyncio.to_thread(AudioSegment.from_file, combined_audio_path)
-        voice_audio = voice_audio + 0.1  # 音量
+        voice_audio = voice_audio + 0.1  # 音量調整
+        
+        # 背景音楽の長さを音声に合わせる
+        background_music_audio = background_music_audio[:len(voice_audio)]
+        
+        # 背景音楽にフェードアウトを適用
+        background_music_audio = background_music_audio.fade_out(duration=int(video_fade_duration * 1000))
+        
         mixed_audio = voice_audio.overlay(background_music_audio)
         mixed_audio_path = os.path.join(current_dir, "..", f"mixed_audio_{timestamp}.mp3")
         await asyncio.to_thread(mixed_audio.export, mixed_audio_path, format='mp3')
         logger.info("音声ミキシング完了")
 
+        # 音声の長さを取得
+        audio_info = mediainfo(mixed_audio_path)
+        audio_duration = float(audio_info['duration'])
+
+        # 総ビデオ時間を計算（音声の長さ + ビデオのフェードイン時間 + ビデオのフェードアウト時間）
+        total_video_duration = video_fade_duration + audio_duration + video_fade_duration
+
         logger.info("テロップ用タイムスタンプの作成開始")
         scene_timestamps = []
-        cumulative_time = 0.0
+        cumulative_time = video_fade_duration  # ビデオのフェードイン時間を初期値とする
         for idx, scene in enumerate(script):
             scene_duration = durations[idx] if idx < len(durations) else 5.0  # デフォルトを5秒とする
             scene_start = cumulative_time
             scene_end = cumulative_time + scene_duration
-            # wrap_text の代わりに textwrap.wrap を使用
             wrapped_text = '\n'.join(textwrap.wrap(scene['script'], width=40))
             scene_timestamps.append((wrapped_text, scene_start, scene_end))
             cumulative_time = scene_end
@@ -62,7 +79,7 @@ async def create_video(script: list, images: list, audio_clips: list, background
         else:
             width, height = 1280, 720
 
-        bg_input = ffmpeg.input(background_video, stream_loop=-1, t=total_duration)
+        bg_input = ffmpeg.input(background_video, stream_loop=-1, t=total_video_duration)
         video = bg_input.video
 
         # ここを修正
@@ -72,7 +89,7 @@ async def create_video(script: list, images: list, audio_clips: list, background
             .filter('setsar', '1')
         )
 
-        image_display_times = calculate_image_display_times(durations)
+        image_display_times = calculate_image_display_times(durations, video_fade_duration)
         temp_dir = tempfile.mkdtemp()
         try:
             for idx, (start, end) in enumerate(image_display_times):
@@ -120,18 +137,19 @@ async def create_video(script: list, images: list, audio_clips: list, background
                     line_spacing=5
                 )
 
-            # フェード処理の調整
-            video_fade_duration = 2.0  # ビデオのフェード時間
-            audio_fade_duration = 0.5  # 音声のフェード時間
-
+            # フェード処理の適用
             video = video.filter('fade', type='in', duration=video_fade_duration)
-            video = video.filter('fade', type='out', start_time=total_duration-video_fade_duration, duration=video_fade_duration)
+            video = video.filter('fade', type='out', start_time=video_fade_duration + audio_duration, duration=video_fade_duration)
 
             audio_input = ffmpeg.input(mixed_audio_path)
 
-            # 音声のフェードイン・フェードアウトを調整
+            # 音声の開始を遅らせる（ビデオのフェードイン後に開始）
+            audio_input = audio_input.filter('adelay', f'{int(video_fade_duration * 1000)}|{int(video_fade_duration * 1000)}')
+
+            # 音声のフェードイン
             audio_input = audio_input.filter('afade', type='in', duration=audio_fade_duration)
-            audio_input = audio_input.filter('afade', type='out', start_time=total_duration-audio_fade_duration, duration=audio_fade_duration)
+            
+            # 音声のフェードアウトは不要なので削除
 
             audio_input = (
                 audio_input
@@ -140,7 +158,7 @@ async def create_video(script: list, images: list, audio_clips: list, background
 
             output = (
                 ffmpeg
-                .output(video, audio_input, output_path, vcodec='libx264', acodec='aac', audio_bitrate='192k', t=total_duration)
+                .output(video, audio_input, output_path, vcodec='libx264', acodec='aac', audio_bitrate='192k', t=total_video_duration)
                 .overwrite_output()
             )
             
@@ -201,9 +219,9 @@ def combine_audio(audio_paths: list, output_path: str) -> str:
     combined.export(output_path, format='mp3', parameters=["-ar", str(target_sample_rate)])
     return output_path
 
-def calculate_image_display_times(durations):
+def calculate_image_display_times(durations, video_fade_duration):
     image_display_times = []
-    cumulative_time = 0.0
+    cumulative_time = video_fade_duration  # ビデオのフェードイン時間を初期値とする
     for i in range(0, len(durations), 3):
         group_durations = durations[i:i+3]
         start_time = cumulative_time
