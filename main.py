@@ -110,7 +110,7 @@ def generate_script(note_content: str) -> list:
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": "ノート内容から30秒前後の動画用の台詞を成してください。各シーンを辞書形式で返してください。各シーンは'scene_number'、'description'、'script'のキーを持つ必要があります。返答は必ず有効なJSONフォーマットにしてください。全て日本語で書いてください。"},
+            {"role": "system", "content": "ノート内容から30秒前後の動画用の台詞を作成してください。各シーンを辞書形式で返してください。各シーンは'scene_number'、'description'、'script'のキーを持つ必要があります。返答は必ず有効なJSONフォーマットにしてください。全て日本語で書いてください。"},
             {"role": "user", "content": note_content}
         ]
     )
@@ -124,14 +124,16 @@ def generate_script(note_content: str) -> list:
         
         parsed_content = json.loads(content)
         
-        if "scenes" in parsed_content:
+        if isinstance(parsed_content, dict) and "scenes" in parsed_content:
             scenes = parsed_content["scenes"]
-        else:
+        elif isinstance(parsed_content, list):
             scenes = parsed_content
+        else:
+            raise ValueError("予期しない形式のJSONが返されました。")
         
-        for scene in scenes:
+        for i, scene in enumerate(scenes, start=1):
             if "scene_number" not in scene:
-                scene["scene_number"] = scenes.index(scene) + 1
+                scene["scene_number"] = i
             if "description" not in scene:
                 scene["description"] = f"シーン {scene['scene_number']}"
             if "script" not in scene and "dialogue" in scene:
@@ -139,12 +141,12 @@ def generate_script(note_content: str) -> list:
         
         return scenes
     except json.JSONDecodeError as e:
-        print(f"JSONデコードエラ: {e}")
-        print(f"APIレスポンス: {content}")
+        logger.error(f"JSONデコードエラー: {e}")
+        logger.error(f"APIレスポンス: {content}")
         raise ValueError("APIからの応答を解析できませんでした。")
     except Exception as e:
-        print(f"予期せぬエラー: {e}")
-        print(f"APIレスポンス: {content}")
+        logger.error(f"予期せぬエラー: {e}")
+        logger.error(f"APIレスポンス: {content}")
         raise ValueError(f"APIからの応答の処理中にエラーが発生しました: {str(e)}")
 
 def generate_images(script: list) -> list:
@@ -220,7 +222,7 @@ def select_background(note_content: str) -> str:
         raise FileNotFoundError("背景動画が見つかりません。")
     
     prompt = f"""
-    以下のノート���容に最も適した背景動画を選んでください。
+    以下のノート容に最も適した背景動画を選んでください。
     選択肢は次の通りです: {', '.join(backgrounds)}
     
     ノート内容:
