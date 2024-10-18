@@ -94,8 +94,8 @@ async def create_video(script: list, images: list, audio_clips: list, background
             for idx, (text, start, end) in enumerate(scene_timestamps):
                 if video_type == 'portrait':
                     y_position = 'h-th-120'  # テキストの高さを考慮
-                    fontsize = 26
-                    max_width = 30  # ポートレートモードでの最大文字数
+                    fontsize = 30
+                    max_width = 20  # ポートレートモードでの最大文字数
                 else:
                     y_position = 'h-th-60'  # テキストの高さを考慮
                     fontsize = 26
