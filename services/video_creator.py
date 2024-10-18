@@ -7,6 +7,7 @@ import asyncio
 import logging
 import tempfile
 import subprocess
+from pydub.utils import mediainfo
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -24,7 +25,7 @@ async def create_video(script: list, images: list, audio_clips: list, background
         total_duration = sum(durations)
         logger.info(f"音声ファイルの結合完了。総再生時間: {total_duration}秒")
 
-        logger.info("背景音楽の準備開始")
+        logger.info("背景音楽の準備開")
         background_music_audio = await asyncio.to_thread(AudioSegment.from_file, background_music)
         background_music_audio = background_music_audio - 22  # 音量を30%下げる（-10dB）
         if len(background_music_audio) < total_duration * 1000:
@@ -108,7 +109,7 @@ async def create_video(script: list, images: list, audio_clips: list, background
                     line_spacing=5
                 )
 
-            fade_duration = 1.0
+            fade_duration = 2.0  # 1秒から2秒に変更
 
             video = video.filter('fade', type='in', duration=fade_duration)
             video = video.filter('fade', type='out', start_time=total_duration-fade_duration, duration=fade_duration)
@@ -118,9 +119,16 @@ async def create_video(script: list, images: list, audio_clips: list, background
             audio_input = audio_input.filter('afade', type='in', duration=fade_duration)
             audio_input = audio_input.filter('afade', type='out', start_time=total_duration-fade_duration, duration=fade_duration)
 
+            audio_input = (
+                audio_input
+                .filter('afftdn', nr=2, nt='w', om='o')  # ノイズ除去フィルター
+                # .filter('highpass', f=200)  # 低周波ノイズを除去 (削除)
+                # .filter('lowpass', f=3000)  # 高周波ノイズを除去 (削除)
+            )
+
             output = (
                 ffmpeg
-                .output(video, audio_input, output_path, vcodec='libx264', acodec='aac', audio_bitrate='128k', t=total_duration)
+                .output(video, audio_input, output_path, vcodec='libx264', acodec='aac', audio_bitrate='192k', t=total_duration)
                 .overwrite_output()
             )
             
@@ -166,10 +174,19 @@ async def create_video(script: list, images: list, audio_clips: list, background
 
 def combine_audio(audio_paths: list, output_path: str) -> str:
     combined = AudioSegment.empty()
+    target_sample_rate = 44100  # 目標サンプリングレート
+
     for audio_path in audio_paths:
         audio = AudioSegment.from_file(audio_path)
+        info = mediainfo(audio_path)
+        original_sample_rate = int(info['sample_rate'])
+        
+        if original_sample_rate != target_sample_rate:
+            audio = audio.set_frame_rate(target_sample_rate)
+        
         combined += audio
-    combined.export(output_path, format='mp3')
+
+    combined.export(output_path, format='mp3', parameters=["-ar", str(target_sample_rate)])
     return output_path
 
 def calculate_image_display_times(durations):
@@ -183,3 +200,6 @@ def calculate_image_display_times(durations):
         image_display_times.append((start_time, end_time))
         cumulative_time = end_time
     return image_display_times
+
+def normalize_audio(audio_segment: AudioSegment) -> AudioSegment:
+    return audio_segment.normalize()
