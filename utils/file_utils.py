@@ -77,8 +77,25 @@ def select_background_music(note_content: str) -> str:
     
     return full_path
 
-def wrap_text(text, max_width=40):
-    return '\n'.join(textwrap.wrap(text, width=max_width))
+def wrap_text(text: str, max_width: int) -> str:
+    words = text.split()
+    lines = []
+    current_line = []
+    current_width = 0
+
+    for word in words:
+        if current_width + len(word) + 1 > max_width:
+            lines.append(' '.join(current_line))
+            current_line = [word]
+            current_width = len(word)
+        else:
+            current_line.append(word)
+            current_width += len(word) + 1
+
+    if current_line:
+        lines.append(' '.join(current_line))
+
+    return '\n'.join(lines)
 
 def escape_ffmpeg_text(text: str) -> str:
     text = text.replace('\\', '\\\\').replace("'", "\\'")

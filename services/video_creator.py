@@ -2,17 +2,19 @@ import os
 import time
 import ffmpeg
 from pydub import AudioSegment
-from utils.file_utils import wrap_text, escape_ffmpeg_text
+from utils.file_utils import escape_ffmpeg_text
 import asyncio
 import logging
 import tempfile
 import subprocess
 from pydub.utils import mediainfo
+from PIL import Image
+import textwrap
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-async def create_video(script: list, images: list, audio_clips: list, background_video: str, background_music: str, durations: list) -> str:
+async def create_video(script: list, images: list, audio_clips: list, background_video: str, background_music: str, durations: list, video_type: str = 'landscape') -> str:
     try:
         logger.info("動画作成開始")
         current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -27,7 +29,7 @@ async def create_video(script: list, images: list, audio_clips: list, background
 
         logger.info("背景音楽の準備開")
         background_music_audio = await asyncio.to_thread(AudioSegment.from_file, background_music)
-        background_music_audio = background_music_audio - 22  # 音量を30%下げる（-10dB）
+        background_music_audio = background_music_audio - 20  # 音量を30%下げる（-10dB）
         if len(background_music_audio) < total_duration * 1000:
             background_music_audio = background_music_audio * (int(total_duration * 1000 / len(background_music_audio)) + 1)
         background_music_audio = background_music_audio[:int(total_duration * 1000)]
@@ -48,82 +50,92 @@ async def create_video(script: list, images: list, audio_clips: list, background
             scene_duration = durations[idx] if idx < len(durations) else 5.0  # デフォルトを5秒とする
             scene_start = cumulative_time
             scene_end = cumulative_time + scene_duration
-            wrapped_text = wrap_text(scene['script'], max_width=40)  # テキストを折り返す
+            # wrap_text の代わりに textwrap.wrap を使用
+            wrapped_text = '\n'.join(textwrap.wrap(scene['script'], width=40))
             scene_timestamps.append((wrapped_text, scene_start, scene_end))
             cumulative_time = scene_end
         logger.info("テロップ用タイムスタンプの作成完了")
 
         logger.info("FFmpeg処理開始")
+        if video_type == 'portrait':
+            width, height = 720, 1280
+        else:
+            width, height = 1280, 720
+
         bg_input = ffmpeg.input(background_video, stream_loop=-1, t=total_duration)
         video = bg_input.video
 
-        video = video.filter('scale', 'min(1280, iw)', 'min(720, ih)', force_original_aspect_ratio='decrease')\
-                     .filter('pad', 1280, 720, '(ow-iw)/2', '(oh-ih)/2')
+        # ここを修正
+        video = (
+            video.filter('scale', w=width, h=height, force_original_aspect_ratio='increase')
+            .filter('crop', w=width, h=height)
+            .filter('setsar', '1')
+        )
 
         image_display_times = calculate_image_display_times(durations)
         temp_dir = tempfile.mkdtemp()
         try:
             for idx, (start, end) in enumerate(image_display_times):
                 img_path = os.path.join(temp_dir, f"temp_image_{idx}.png")
-                await asyncio.to_thread(images[idx].save, img_path)
+                resized_image = resize_image(images[idx], width, height)
+                await asyncio.to_thread(resized_image.save, img_path)
                 img_input = ffmpeg.input(img_path)
                 
                 video = video.overlay(
                     img_input,
-                    x='(main_w-overlay_w)/2',
-                    y='(main_h-overlay_h)/2',
+                    x='0',
+                    y='0',
                     enable=f'between(t,{start},{end})'
                 )
 
-            # 本番環境用のコード（コメントアウト） これは消さない！！
-            '''
-            for idx, (start, end) in enumerate(image_display_times):
-                img_path = f"/tmp/temp_image_{idx}.png"
-                await asyncio.to_thread(images[idx].save, img_path)
-                img_input = ffmpeg.input(img_path)
-                
-                video = video.overlay(
-                    img_input,
-                    x='(main_w-overlay_w)/2',
-                    y='(main_h-overlay_h)/2',
-                    enable=f'between(t,{start},{end})'
-                )
-            '''
-        
             font_path = os.path.join(current_dir, '..', 'font.ttf')
             font_path = os.path.abspath(font_path)
 
             for idx, (text, start, end) in enumerate(scene_timestamps):
-                escaped_text = escape_ffmpeg_text(text)
+                if video_type == 'portrait':
+                    y_position = 'h-th-120'  # テキストの高さを考慮
+                    fontsize = 26
+                    max_width = 30  # ポートレートモードでの最大文字数
+                else:
+                    y_position = 'h-th-60'  # テキストの高さを考慮
+                    fontsize = 26
+                    max_width = 40  # ランドスケープモードでの最大文字数
+
+                # テキストを折り返す
+                wrapped_lines = textwrap.wrap(text, width=max_width)
+                wrapped_text = '\n'.join(wrapped_lines)
+                escaped_text = escape_ffmpeg_text(wrapped_text)
+
                 video = video.drawtext(
                     text=escaped_text,
                     fontfile=font_path,
-                    fontsize=24,
+                    fontsize=fontsize,
                     fontcolor='white',
                     box=1,
                     boxcolor='black@0.8',
                     boxborderw=10,
-                    x='(w-text_w)/2',
-                    y='h-text_h-60',
+                    x='(w-tw)/2',  # 水平方向の中央配置
+                    y=y_position,
                     enable=f'between(t,{start},{end})',
                     line_spacing=5
                 )
 
-            fade_duration = 2.0  # 1秒から2秒に変更
+            # フェード処理の調整
+            video_fade_duration = 2.0  # ビデオのフェード時間
+            audio_fade_duration = 0.5  # 音声のフェード時間
 
-            video = video.filter('fade', type='in', duration=fade_duration)
-            video = video.filter('fade', type='out', start_time=total_duration-fade_duration, duration=fade_duration)
+            video = video.filter('fade', type='in', duration=video_fade_duration)
+            video = video.filter('fade', type='out', start_time=total_duration-video_fade_duration, duration=video_fade_duration)
 
             audio_input = ffmpeg.input(mixed_audio_path)
 
-            audio_input = audio_input.filter('afade', type='in', duration=fade_duration)
-            audio_input = audio_input.filter('afade', type='out', start_time=total_duration-fade_duration, duration=fade_duration)
+            # 音声のフェードイン・フェードアウトを調整
+            audio_input = audio_input.filter('afade', type='in', duration=audio_fade_duration)
+            audio_input = audio_input.filter('afade', type='out', start_time=total_duration-audio_fade_duration, duration=audio_fade_duration)
 
             audio_input = (
                 audio_input
                 .filter('afftdn', nr=2, nt='w', om='o')  # ノイズ除去フィルター
-                # .filter('highpass', f=200)  # 低周波ノイズを除去 (削除)
-                # .filter('lowpass', f=3000)  # 高周波ノイズを除去 (削除)
             )
 
             output = (
@@ -203,3 +215,28 @@ def calculate_image_display_times(durations):
 
 def normalize_audio(audio_segment: AudioSegment) -> AudioSegment:
     return audio_segment.normalize()
+
+def resize_image(image: Image.Image, width: int, height: int) -> Image.Image:
+    aspect_ratio = image.width / image.height
+    target_ratio = width / height
+
+    # 画像の新しいサイズを計算（高さを100px小さくする）
+    new_height = height - 100
+    new_width = int(new_height * aspect_ratio)
+
+    # 新しい幅が全体の幅を超える場合は、幅に合わせて調整
+    if new_width > width:
+        new_width = width
+        new_height = int(width / aspect_ratio)
+
+    resized_image = image.resize((new_width, new_height), Image.LANCZOS)
+
+    # 新しい背景画像を作成（透明）
+    background = Image.new('RGBA', (width, height), (0, 0, 0, 0))
+
+    # リサイズした画像を中央に配置
+    paste_x = (width - new_width) // 2
+    paste_y = (height - new_height) // 2
+    background.paste(resized_image, (paste_x, paste_y))
+
+    return background

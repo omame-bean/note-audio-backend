@@ -20,16 +20,26 @@ router = APIRouter()
 class VideoRequest(BaseModel):
     client_id: str
     note_content: str
+    video_type: str = 'landscape'  # 'landscape' または 'portrait'
 
-class VideoResponse(BaseModel):
-    video_url: str
+@router.post("/generate-video")
+async def generate_video(request: VideoRequest, background_tasks: BackgroundTasks):
+    try:
+        # note_contentの検証
+        if not request.note_content:
+            raise HTTPException(status_code=400, detail="ノート内容が指定されていません")
 
-@router.post("/generate-video", response_model=VideoResponse)
-async def generate_video(video_request: VideoRequest, background_tasks: BackgroundTasks):
-    client_id = video_request.client_id
-    note_content = video_request.note_content
-    background_tasks.add_task(run_video_generation, client_id, note_content)
-    return VideoResponse(video_url="")
+        # ビデオタイプの検証
+        if request.video_type not in ['landscape', 'portrait']:
+            raise HTTPException(status_code=400, detail="無効なビデオタイプです。'landscape'または'portrait'を指定してください")
+
+        # バックグラウンドタスクとして動画生成を実行
+        background_tasks.add_task(run_video_generation, request.client_id, request.note_content, request.video_type)
+
+        return {"message": "動画生成タスクが開始されました", "client_id": request.client_id}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/events/{client_id}")
 async def events(client_id: str):
@@ -44,9 +54,9 @@ async def download_video(video_filename: str, client_id: str = Query(...)):
     else:
         raise HTTPException(status_code=404, detail=f"動画が見つかりません: {video_path}")
 
-async def run_video_generation(client_id: str, note_content: str):
+async def run_video_generation(client_id: str, note_content: str, video_type: str):
     try:
-        logger.info(f"動画生成開始 - クライアントID: {client_id}")
+        logger.info(f"動画生成開始 - クライアントID: {client_id}, ビデオタイプ: {video_type}")
         await update_progress(client_id, "テキスト解析", "in-progress", "テキスト解析中...")
         script = await generate_script(note_content)
         await update_progress(client_id, "テキスト解析", "completed", "台詞が正常に生成されました")
@@ -66,7 +76,7 @@ async def run_video_generation(client_id: str, note_content: str):
 
         await update_progress(client_id, "動画編集", "in-progress", "動画編集中...")
         logger.info("動画編集開始")
-        video_filename = await create_video(script, images, audio_clips, background_video, background_music, durations)
+        video_filename = await create_video(script, images, audio_clips, background_video, background_music, durations, video_type)
         logger.info(f"動画編集完了: {video_filename}")
         await update_progress(client_id, "動画編集", "completed", f"動画が正確に作成されました: {video_filename}")
 
