@@ -152,7 +152,7 @@ async def run_video_generation(client_id: str, note_content: str):
             }
             client_progress[client_id].append(json.dumps(progress))
             logger.info(f"クライアント {client_id}: {progress}")
-            await asyncio.sleep(0.1)  # 短い遅延を追加
+            await send_progress(progress)
 
         # テキスト解析
         await update_progress("テキスト解析", "in-progress", "テキスト解析中...")
@@ -559,6 +559,28 @@ def create_video(script: list, images: list, audio_clips: list, background_video
             scene_timestamps.append((wrapped_text, scene_start, scene_end))
             cumulative_time = scene_end
 
+        # 背景動画を無限ループさせて、音声の長さに合わせる
+        bg_input = ffmpeg.input(background_video, stream_loop=-1, t=total_duration)
+        video = bg_input.video
+
+        # 背景動画をスケールとパッドを適用
+        video = video.filter('scale', 'min(1280, iw)', 'min(720, ih)', force_original_aspect_ratio='decrease')\
+                     .filter('pad', 1280, 720, '(ow-iw)/2', '(oh-ih)/2')
+
+        # 画像をオーバーレイ
+        for idx, (start, end) in enumerate(image_display_times):
+            img_path = os.path.join(temp_dir, f"temp_image_{idx}.png")
+            images[idx].save(img_path)  # 一意なパスで画像を保存
+            img_input = ffmpeg.input(img_path)
+            
+            # 画像を中央にオーバーレイ
+            video = video.overlay(
+                img_input,
+                x='(main_w-overlay_w)/2',
+                y='(main_h-overlay_h)/2',
+                enable=f'between(t,{start},{end})'
+            )
+
         # フォントファイルの絶対パスを取得
         font_path = os.path.join(current_dir, 'font.ttf')
         font_path = os.path.abspath(font_path)  # 絶対パスに変換
@@ -571,119 +593,66 @@ def create_video(script: list, images: list, audio_clips: list, background_video
         logger.debug(f"Using font file: {font_path}")
         logger.debug(f"フォントパス: {font_path} (存在: {os.path.exists(font_path)})")
 
-        # 一時ディレクトリの作成と権限の確認
-        os.makedirs(temp_dir, exist_ok=True)
-        os.chmod(temp_dir, 0o755)  # 読み取り、書き込み、実行権限を付与
-
-        # 画像の保存時にログを追加
-        for idx, image in enumerate(images):
-            img_path = os.path.join(temp_dir, f"temp_image_{idx}.png")
-            image.save(img_path)
-            logger.info(f"画像を保存しました: {img_path}")
-
-        # 画像ファイルの存在確認を早めに行う
-        for idx in range(len(image_display_times)):
-            img_path = os.path.join(temp_dir, f"temp_image_{idx}.png")
-            if not os.path.exists(img_path):
-                logger.error(f"一時画像ファイルが存在しません: {img_path}")
-                raise FileNotFoundError(f"一時画像ファイルが存在しません: {img_path}")
-            else:
-                logger.info(f"一時画像ファイルが存在します: {img_path}")
-
-        # 1. 背景動画のスケーリングのみを行う
-        scaled_bg = ffmpeg.input(background_video, stream_loop=-1, t=total_duration)
-        scaled_output = scaled_bg.filter('scale', 'min(1280, iw)', 'min(720, ih)', force_original_aspect_ratio='decrease')\
-                                 .filter('pad', 1280, 720, '(ow-iw)/2', '(oh-ih)/2')
-        scaled_output_path = os.path.join(temp_dir, "scaled_bg.mp4")
-        
-        try:
-            process = (
-                ffmpeg
-                .output(scaled_output, scaled_output_path)
-                .overwrite_output()
-                .run_async(pipe_stdout=True, pipe_stderr=True)
-            )
-            stdout, stderr = process.communicate()
-            if process.returncode != 0:
-                logger.error(f"FFmpeg error: {stderr.decode()}")
-                raise ffmpeg.Error(cmd=process.args, stdout=stdout, stderr=stderr)
-            logger.info("背景動画のスケーリングが成功しました。")
-        except ffmpeg.Error as e:
-            logger.error(f"背景動画のスケーリングに失敗しました: {e.stderr.decode()}")
-            raise
-
-        # 2. 画像のオーバーレイを追加
-        video_with_images = ffmpeg.input(scaled_output_path)
-        for idx, (start, end) in enumerate(image_display_times):
-            img_path = os.path.join(temp_dir, f"temp_image_{idx}.png")
-            img_input = ffmpeg.input(img_path)
-            video_with_images = video_with_images.overlay(
-                img_input,
-                x='(main_w-overlay_w)/2',
-                y='(main_h-overlay_h)/2',
-                enable=f'between(t,{start},{end})'
-            )
-        
-        video_with_images_path = os.path.join(temp_dir, "video_with_images.mp4")
-        try:
-            process = (
-                ffmpeg.output(video_with_images, video_with_images_path)
-                .overwrite_output()
-                .run_async(pipe_stdout=True, pipe_stderr=True)
-            )
-            stdout, stderr = process.communicate()
-            if process.returncode != 0:
-                logger.error(f"FFmpeg error: {stderr.decode()}")
-                raise ffmpeg.Error(cmd=process.args, stdout=stdout, stderr=stderr)
-            logger.info("画像のオーバーレイが成功しました。")
-        except ffmpeg.Error as e:
-            logger.error(f"画像のオーバーレイに失敗しました: {e.stderr.decode()}")
-            raise
-
-        # 3. テキストの追加
-        video_with_text = ffmpeg.input(video_with_images_path)
-        for text, start, end in scene_timestamps:
-            video_with_text = video_with_text.drawtext(
-                text=escape_ffmpeg_text(text),
+        # テロップを各シーンごとに追加
+        for idx, (text, start, end) in enumerate(scene_timestamps):
+            escaped_text = escape_ffmpeg_text(text)
+            logger.debug(f"Adding text: '{escaped_text}' from {start} to {end}")
+            video = video.drawtext(
+                text=escaped_text,
                 fontfile=font_path,
                 fontsize=24,
                 fontcolor='white',
                 box=1,
                 boxcolor='black@0.8',
                 boxborderw=10,
-                x='(w-text_w)/2',
-                y='h-text_h-60',
-                enable=f'between(t,{start},{end})'
+                x='(w-text_w)/2',  # テキストを中央配置
+                y='h-text_h-60',    # 下から60pxの位置に配置
+                enable=f'between(t,{start},{end})',
+                line_spacing=5
             )
-        
-        video_with_text_path = os.path.join(temp_dir, "video_with_text.mp4")
-        try:
-            ffmpeg.output(video_with_text, video_with_text_path).overwrite_output().run(capture_stdout=True, capture_stderr=True)
-            logger.info("テキストの追加が成功しました。")
-        except ffmpeg.Error as e:
-            logger.error(f"テキストの追加に失敗しました: {e.stderr.decode()}")
-            raise
 
-        # 4. 音声の結合
+        # フェードイン・フェードアウトの長さ（秒）
+        fade_duration = 1.0
+
+        # 動画にフェードイン・フェードアウトを追加
+        video = video.filter('fade', type='in', duration=fade_duration)
+        video = video.filter('fade', type='out', start_time=total_duration-fade_duration, duration=fade_duration)
+
+        # 音声入力を変更
         audio_input = ffmpeg.input(mixed_audio_path)
-        video_input = ffmpeg.input(video_with_text_path)
+
+        # 音声にフェードイン・フェードアウトを追加
+        audio_input = audio_input.filter('afade', type='in', duration=fade_duration)
+        audio_input = audio_input.filter('afade', type='out', start_time=total_duration-fade_duration, duration=fade_duration)
+
+        # 動画と音声を結合して出力
+        output = (
+            ffmpeg
+            .output(video, audio_input, output_path, vcodec='libx264', acodec='aac', audio_bitrate='128k', t=total_duration)
+            .overwrite_output()
+        )
         
-        output_path = os.path.join(current_dir, f"generated_video_{timestamp}.mp4")
+        logger.info("FFmpegコマンドを実行します")
+        logger.info(f"FFmpegコマンド: {' '.join(ffmpeg.compile(output))}")
+        
         try:
-            ffmpeg.output(video_input, audio_input, output_path, vcodec='libx264', acodec='aac').overwrite_output().run(capture_stdout=True, capture_stderr=True)
-            logger.info("音声の結合が成功しました。")
-        except ffmpeg.Error as e:
-            logger.error(f"音声の結合に失敗しました: {e.stderr.decode()}")
+            # FFmpegコマンドの実行（スレッド数制限と詳細ログ取得）
+            output = output.global_args('-threads', '2', '-v', 'debug')
+            ffmpeg.run(output, capture_stdout=True, capture_stderr=True)
+        except ffmpeg._run.Error as e:
+            error_log_path = os.path.join(temp_dir, 'ffmpeg_error.log')
+            if os.path.exists(error_log_path):
+                with open(error_log_path, 'r') as f:
+                    error_content = f.read()
+                logger.error(f"FFmpeg detailed error log:\n{error_content}")
+            else:
+                logger.error(f"FFmpeg error log not found at {error_log_path}")
             raise
-
+        except Exception as e:
+            logger.error(f"Unexpected error in create_video: {str(e)}")
+            raise
         logger.info(f"動画が正常に作成されました: {output_path}")
-        return output_path
 
-    except Exception as e:
-        logger.error(f"動画作成中にエラーが発生しました: {str(e)}")
-        raise
-
-    finally:
         # 一時ファイルの削除
         for idx in range(len(image_display_times)):
             img_path = os.path.join(temp_dir, f"temp_image_{idx}.png")
@@ -696,10 +665,13 @@ def create_video(script: list, images: list, audio_clips: list, background_video
         os.remove(combined_audio_path)
         os.remove(mixed_audio_path)
 
+    finally:
         # 一時ディレクトリの削除
         if os.path.exists(temp_dir):
             import shutil
             shutil.rmtree(temp_dir)
+
+    return output_path
 
 @app.get("/test-script")
 async def test_script():
@@ -732,6 +704,10 @@ async def send_error_to_client(client_id: str, error_message: str):
     # この関数を適切に実装してください。例えば：
     logger.error(f"Error for client {client_id}: {error_message}")
     # クライアントにエラーを送信する実際の処理をここに追加
+
+async def send_progress(progress):
+    await asyncio.sleep(0.1)  # 短い遅延を入れて、メイン処理への影響を軽減
+    # 進捗報告の処理
 
 if __name__ == "__main__":
     import uvicorn
