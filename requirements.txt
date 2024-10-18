@@ -1,0 +1,32 @@
+fastapi
+uvicorn
+pydantic
+python-dotenv
+openai
+requests
+Pillow
+moviepy
+pydub
+numpy
+opencv-python-headless
+ffmpeg-python
+python-multipart
+sse-starlette
+aiohttp
+
+# 現在の実装状況
+# バックエンド (main.py):
+# - FastAPIを使用したAPIサーバー
+# - 動画生成リクエストの処理
+# - SSEを使用した進捗状況の送信
+# - OpenAI APIを使用したスクリプト生成
+# - 画像生成、音声合成、動画編集機能
+# - エラーハンドリングとログ記録
+# - 非同期処理のためのaiohttp
+
+# フロントエンド (NoteEditor.tsx):
+# - 動画生成リクエストの送信
+# - SSEを使用した進捗状況の受信と表示
+# - 動画ダウンロード機能
+# - エラー表示
+# - SVGと画像の生成・管理機能

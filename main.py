@@ -32,22 +32,13 @@ import subprocess
 
 app = FastAPI()
 
-@app.get("/check-ffmpeg")
-async def check_ffmpeg():
-    try:
-        result = subprocess.run(["ffmpeg", "-version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if result.returncode == 0:
-            ffmpeg_version = result.stdout.split('\n')[0]
-            return {"ffmpeg_version": ffmpeg_version}
-        else:
-            return {"error": "FFmpegが見つかりませんでした。"}
-    except Exception as e:
-        return {"error": str(e)}
+# 環境変数からFRONTEND_URLを取得
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 
 # CORSミドルウェアを追加
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "https://your-frontend-domain.com"],  # フロントエンドのURLを指定
+    allow_origins=[FRONTEND_URL],  # 環境変数から取得したURLを使用
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -229,7 +220,7 @@ def select_background(note_content: str) -> str:
         raise FileNotFoundError("背景動画が見つかりません。")
     
     prompt = f"""
-    以下のノート内容に最も適した背景動画を選んでください。
+    以下のノート���容に最も適した背景動画を選んでください。
     選択肢は次の通りです: {', '.join(backgrounds)}
     
     ノート内容:
