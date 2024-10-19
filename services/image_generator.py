@@ -13,18 +13,18 @@ async def generate_images(script: list) -> list:
         combined_script = "\n".join([f"シーン{scene['scene_number']}: {scene['script']}" for scene in group_scenes])
         
         prompt = f"""
-        以下の内容を表現するリアルに近いイラストを生成してください。人物はいりません。：
+        以下の内容を表現するリアルなイラストを生成してください。人物はいりません。：
         
         {combined_script}
         
-        要件：
-        - 必ずリアルに近いイラストスタイルで描いてください。
-        - 人物は描かないでください。風景や景色を描いてください。
-        - スクリプトの内容に直接関連する要素を含めてください。
-        - 背景も含め、シーンの雰囲気を表現してください。
-        - 画像の中に文字は絶対に入れないでください。
+        # Requirements:
+        - Please be sure to draw in a realistic illustration style.
+        - Please do not draw people. Please draw landscapes and scenery.
+        - Please include elements that are directly related to the script content.
+        - Please express the atmosphere of the scene, including the background.
+        - Please do not include text or letters.
         
-        このイラストは動画のシーンとして使用されます。適切な構図と内容を心がけてください。
+        This illustration will be used as a scene in a video. Please ensure that it has an appropriate composition and content.
         """
         
         response = client.images.generate(

@@ -13,6 +13,7 @@ ffmpeg-python
 python-multipart
 sse-starlette
 aiohttp
+google-cloud-texttospeech
 
 # 現在の実装状況
 # バックエンド (main.py):

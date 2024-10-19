@@ -2,6 +2,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from config import FRONTEND_URL
 from routes import video, utils
+from dotenv import load_dotenv
+import os
+
+load_dotenv()  # .env ファイルから環境変数を読み込む
 
 app = FastAPI()
 
